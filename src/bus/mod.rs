@@ -438,6 +438,25 @@ fn t_member_name() {
     MemberName::from_bytes(b"a\0").unwrap();
 }
 
+/*
+/// Representation of a callback that may occur in the future.
+///
+/// XXX: when does fiddling with these cause callbacks to get de-registered. Do they ever get
+/// de-registered?
+struct Slot {
+    raw: *mut ffi::sd_bus_slot,
+}
+
+struct SlotRef
+    _inner: ffi::sd_bus_slot,
+}
+
+impl Slot {
+
+
+}
+*/
+
 // TODO: consider providing a duplicate of this that promises it contains an error
 // We need this more general one for writing more direct interfaces into sd-bus, but most user code
 // will only encounter an error that is correctly populated by sd-bus itself.
@@ -454,7 +473,7 @@ pub struct Error {
 impl Error {
     /// Unsafety:
     ///
-    /// - `raw` must be set.
+    /// - `raw` must be populated with valid pointers, is it is if returned by another sd_bus api.
     unsafe fn from_raw(raw: RawError) -> Error {
         let n = CStr::from_ptr(raw.inner.name).to_bytes_with_nul().len();
         let m = if raw.inner.message.is_null() {
@@ -672,10 +691,10 @@ fn t_raw_error() {
 }
 
 /* XXX: fixme: return code does have meaning! */
-extern "C" fn raw_message_handler<F: FnMut(&mut MessageRef) -> Result<()>>(
-    msg: *mut ffi::bus::sd_bus_message,
-    userdata: *mut c_void,
-    ret_error: *mut ffi::bus::sd_bus_error) -> c_int
+extern "C" fn raw_message_handler<F>(msg: *mut ffi::bus::sd_bus_message, userdata: *mut c_void,
+                                     ret_error: *mut ffi::bus::sd_bus_error) -> c_int
+where
+    F: Fn(&mut MessageRef) -> Result<()>
 {
     let m: &mut F = unsafe { transmute(userdata) };
     let e = m(unsafe { MessageRef::from_mut_ptr(msg)});
@@ -821,15 +840,39 @@ impl BusRef {
     }
 
     #[inline]
-    fn as_ptr(&self) -> *mut ffi::bus::sd_bus {
+    pub fn as_ptr(&self) -> *mut ffi::bus::sd_bus {
         unsafe { transmute(self) }
     }
 
+    /// Returns the file descriptor used to communicate from a message bus object. This descriptor
+    /// can be used with `poll(3)` or a similar function to wait for I/O events on the specified
+    /// bus connection object.
+    ///
+    /// This corresponds to [`sd_bus_get_fd`]
+    ///
+    /// [`sd_bus_get_fd`]: https://www.freedesktop.org/software/systemd/man/sd_bus_get_fd.html
+    #[inline]
+    pub fn fd(&self) -> super::Result<c_int> {
+        Ok(sd_try!(ffi::bus::sd_bus_get_fd(self.as_ptr())))
+    }
+
+    /// Returns the I/O events to wait for, suitable for passing to poll or a similar call.
+    /// Returns a combination of `POLLIN`, `POLLOUT`, ... events.
+    ///
+    /// This corresponds to [`sd_bus_get_events`].
+    ///
+    /// [`sd_bus_get_events`]: https://www.freedesktop.org/software/systemd/man/sd_bus_get_events.html
     #[inline]
     pub fn events(&self) -> super::Result<c_int> {
         Ok(sd_try!(ffi::bus::sd_bus_get_events(self.as_ptr())))
     }
 
+    /// Returns the time-out in us to pass to `poll()` or a similar call when waiting for events on
+    /// the specified bus connection.
+    ///
+    /// This corresponds to [`sd_bus_get_timeout`].
+    ///
+    /// [`sd_bus_get_timeout`]: https://www.freedesktop.org/software/systemd/man/sd_bus_get_timeout.html
     #[inline]
     pub fn timeout(&self) -> super::Result<u64> {
         let mut b = unsafe { uninitialized() };
@@ -837,9 +880,61 @@ impl BusRef {
         Ok(b)
     }
 
+    /// Drives the connection between the client and the message bus.
+    /// Each time it is invoked a single operation is executed.
+    ///
+    /// Returns `None` if no operations were pending (and thus no operations were processed).
+    /// Returns `Some(None)` if progress was made but no message was processed.
+    /// Returns `Some(Message)` if a message was processed.
+    ///
+    ///
+    /// This corresponds to [`sd_bus_process`].
+    ///
+    /// [`sd_bus_process`]: https://www.freedesktop.org/software/systemd/man/sd_bus_process.html
     #[inline]
-    pub fn fd(&self) -> super::Result<c_int> {
-        Ok(sd_try!(ffi::bus::sd_bus_get_fd(self.as_ptr())))
+    pub fn process(&mut self) -> super::Result<Option<Option<Message>>>
+    {
+        let mut b = unsafe { uninitialized() };
+        let r = sd_try!(ffi::bus::sd_bus_process(self.as_ptr(), &mut b));
+        if r > 0 {
+            if b.is_null() {
+                Ok(Some(None))
+            } else {
+                Ok(Some(Some(unsafe { Message::take_ptr(b) })))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[inline]
+    pub fn process_priority(&mut self, max_priority: i64) ->
+        super::Result<Option<Option<Message>>>
+    {
+        let mut b = unsafe { uninitialized() };
+        let r = sd_try!(ffi::bus::sd_bus_process_priority(self.as_ptr(), max_priority, &mut b));
+        if r > 0 {
+            if b.is_null() {
+                Ok(Some(None))
+            } else {
+                Ok(Some(Some(unsafe { Message::take_ptr(b) })))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Synchronously waits for I/O on this `Bus` object.
+    ///
+    /// Returns `true` if any I/O was seen.
+    ///
+    /// This corresponds to [`sd_bus_wait`].
+    ///
+    /// [`sd_bus_wait`]: https://www.freedesktop.org/software/systemd/man/sd_bus_wait.html
+    #[inline]
+    pub fn wait(&mut self, timeout_usec: u64) -> super::Result<bool>
+    {
+        Ok(sd_try!(ffi::bus::sd_bus_wait(self.as_ptr(), timeout_usec)) > 0)
     }
 
     #[inline]
@@ -884,7 +979,7 @@ impl BusRef {
     // new_method_errno
 
     // TODO: consider using a guard object for name handling
-    /// This blocks. To get async behavior, use 'call_async' directly.
+    /// This blocks. To get async behavior, use `request_name_async()`
     #[inline]
     pub fn request_name(&self, name: &BusName, flags: u64) -> super::Result<()> {
         sd_try!(ffi::bus::sd_bus_request_name(self.as_ptr(),
@@ -893,7 +988,27 @@ impl BusRef {
         Ok(())
     }
 
-    /// This blocks. To get async behavior, use 'call_async' directly.
+    #[inline]
+    pub fn request_name_async<F> (&self, name: &BusName, flags: u64, callback: &mut F) ->
+        super::Result<()>
+    where
+        F: Fn(&mut MessageRef) -> Result<()>
+    {
+        let f: extern "C" fn(*mut ffi::bus::sd_bus_message,
+                             *mut c_void,
+                             *mut ffi::bus::sd_bus_error)
+                             -> c_int = raw_message_handler::<F>;
+        sd_try!(ffi::bus::sd_bus_request_name_async(self.as_ptr(),
+            ptr::null_mut(),
+            &*name as *const _ as *const _,
+            flags,
+            Some(f),
+            callback as *mut _ as *mut _
+        ));
+        Ok(())
+    }
+
+    /// This blocks. To get async behavior, use `request_name` directly.
     #[inline]
     pub fn release_name(&self, name: &BusName) -> super::Result<()> {
         sd_try!(ffi::bus::sd_bus_release_name(self.as_ptr(), &*name as *const _ as *const _));
@@ -909,10 +1024,9 @@ impl BusRef {
     //  - cb: &FnMut
     //  - cb: &CustomTrait
     #[inline]
-    pub fn add_object<F: FnMut(&mut MessageRef) -> Result<()>>(&self,
-                                                                      path: &ObjectPath,
-                                                                      cb: &mut F)
-                                                                      -> super::Result<()> {
+    pub fn add_object<F>(&self, path: &ObjectPath, cb: &mut F) -> super::Result<()>
+            where F: Fn(&mut MessageRef) -> Result<()>
+    {
         let f: extern "C" fn(*mut ffi::bus::sd_bus_message,
                              *mut c_void,
                              *mut ffi::bus::sd_bus_error)
@@ -1256,10 +1370,8 @@ impl MessageRef {
     // XXX: we may need to move this, unclear we have the right lifetime here (we're being too
     // strict)
     #[inline]
-    pub fn call_async<F: FnMut(&mut MessageRef) -> Result<()>>(&mut self,
-                                                                      callback: &mut F,
-                                                                      usec: u64)
-                                                                      -> super::Result<()> {
+    pub fn call_async<F>(&mut self, callback: &mut F, usec: u64) -> super::Result<()>
+            where F: Fn(&mut MessageRef) -> Result<()> + 'static + Sync + Send {
         let f: extern "C" fn(*mut ffi::bus::sd_bus_message,
                              *mut c_void,
                              *mut ffi::bus::sd_bus_error)
