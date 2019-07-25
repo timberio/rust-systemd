@@ -402,3 +402,5 @@ impl Drop for Journal {
         }
     }
 }
+
+unsafe impl Send for Journal {}
