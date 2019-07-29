@@ -8,6 +8,7 @@ pub const SD_JOURNAL_LOCAL_ONLY: c_int = 1;
 pub const SD_JOURNAL_RUNTIME_ONLY: c_int = 2;
 pub const SD_JOURNAL_SYSTEM: c_int = 4;
 pub const SD_JOURNAL_CURRENT_USER: c_int = 8;
+pub const SD_JOURNAL_OS_ROOT: c_int = 16;
 
 // Wakeup event types
 pub const SD_JOURNAL_NOP: c_int = 0;
