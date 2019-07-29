@@ -24,6 +24,7 @@ extern "C" {
     // (we don't need to do c-style format strings)
 
     pub fn sd_journal_open(ret: *mut *mut sd_journal, flags: c_int) -> c_int;
+    pub fn sd_journal_open_directory(ret: *mut *mut sd_journal, path: *const c_char, flags: c_int) -> c_int;
     pub fn sd_journal_close(j: *mut sd_journal) -> ();
 
     pub fn sd_journal_previous(j: *mut sd_journal) -> c_int;
